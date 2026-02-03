@@ -453,32 +453,37 @@ def add_update_fields(joined_layer):
     """Add fields for tracking update status and QA."""
     log("Adding update tracking fields...")
 
-    existing_fields = [f.name for f in arcpy.ListFields(joined_layer)]
+    # Helper function to safely add fields
+    def safe_add_field(layer, field_name, field_type, **kwargs):
+        """Add field only if it doesn't exist, or delete and recreate if it does."""
+        existing_fields = [f.name for f in arcpy.ListFields(layer)]
+        if field_name in existing_fields:
+            log(f"  Field '{field_name}' already exists, skipping")
+            return False
+        else:
+            arcpy.AddField_management(layer, field_name, field_type, **kwargs)
+            return True
 
     # Add output WETLAND field (final classification)
-    if EXISTING_CLASS_FIELD not in existing_fields:
-        arcpy.AddField_management(joined_layer, EXISTING_CLASS_FIELD, "TEXT", field_length=50)
+    if safe_add_field(joined_layer, EXISTING_CLASS_FIELD, "TEXT", field_length=50):
         log(f"  Added {EXISTING_CLASS_FIELD} field (output wetland classification)")
 
-    if "Previous_WETLAND" not in existing_fields:
-        arcpy.AddField_management(joined_layer, "Previous_WETLAND", "TEXT", field_length=50)
+    if safe_add_field(joined_layer, "Previous_WETLAND", "TEXT", field_length=50):
         log("  Added Previous_WETLAND field (original wetland classification for tracking changes)")
 
-    if "Update_Status" not in existing_fields:
-        arcpy.AddField_management(joined_layer, "Update_Status", "TEXT", field_length=20)
+    if safe_add_field(joined_layer, "Update_Status", "TEXT", field_length=20):
+        log("  Added Update_Status field")
 
-    if "IS_NEW" not in existing_fields:
-        arcpy.AddField_management(joined_layer, "IS_NEW", "SHORT")
+    if safe_add_field(joined_layer, "IS_NEW", "SHORT"):
         log("  Added IS_NEW field (0=Existing, 1=New)")
 
-    if "Update_Date" not in existing_fields:
-        arcpy.AddField_management(joined_layer, "Update_Date", "DATE")
+    if safe_add_field(joined_layer, "Update_Date", "DATE"):
+        log("  Added Update_Date field")
 
-    if "Original_Code" not in existing_fields:
-        arcpy.AddField_management(joined_layer, "Original_Code", "TEXT", field_length=20)
+    if safe_add_field(joined_layer, "Original_Code", "TEXT", field_length=20):
+        log("  Added Original_Code field")
 
-    if "Source_OBJECTID" not in existing_fields:
-        arcpy.AddField_management(joined_layer, "Source_OBJECTID", "LONG")
+    if safe_add_field(joined_layer, "Source_OBJECTID", "LONG"):
         log("  Added Source_OBJECTID field (original wetland ID for traceability)")
 
     if "Previous_WETLAND" not in existing_fields:
