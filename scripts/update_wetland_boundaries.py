@@ -460,6 +460,10 @@ def add_update_fields(joined_layer):
         arcpy.AddField_management(joined_layer, EXISTING_CLASS_FIELD, "TEXT", field_length=50)
         log(f"  Added {EXISTING_CLASS_FIELD} field (output wetland classification)")
 
+    if "Previous_WETLAND" not in existing_fields:
+        arcpy.AddField_management(joined_layer, "Previous_WETLAND", "TEXT", field_length=50)
+        log("  Added Previous_WETLAND field (original wetland classification for tracking changes)")
+
     if "Update_Status" not in existing_fields:
         arcpy.AddField_management(joined_layer, "Update_Status", "TEXT", field_length=20)
 
