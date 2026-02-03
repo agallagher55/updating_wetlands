@@ -1,0 +1,20 @@
+NAT_stream
+
+
+NAT_wetland_freshwater
+
+SOURCE
+https://data.novascotia.ca/Lands-Forests-and-Wildlife/Nova-Scotia-Topographic-DataBase-Water-Features-Po/h8jb-hzrm/about_data
+
+Setup
+
+Open the script and update the CONFIGURATION section at the top:
+
+EXISTING_WETLANDS — path to your current wetland data
+NSTDB_WATER_FEATURES — path to the downloaded NSTDB polygon layer
+OUTPUT_GDB — where to save results
+EXISTING_CLASS_FIELD — your field name for wetland class (if not "Wetland_Class")
+
+
+Adjust RELEVANT_FEAT_CODES if you want to include/exclude certain NSTDB feature types
+Modify DEFAULT_CLASS_MAPPING if you want different default classifications for new polygons
