@@ -1,11 +1,30 @@
 """
 Update Wetland Boundaries Script for ArcGIS Pro
 ------------------------------------------------
-This script updates wetland polygon boundaries from new NSTDB data while 
-preserving existing Canadian Wetland Classification System classes.
+This script creates a new wetland feature class from NSTDB data while preserving
+existing Canadian Wetland Classification System classes and feat_codes.
 
-Also generates a LOOKUP TABLE showing which NSTDB feat_codes map to which
-WETLAND classifications based on spatial overlap with existing data.
+The output is a LOCAL feature class in the scratch geodatabase that is ready
+for TRUNCATE and LOAD operations into the production SDE feature class.
+
+Key Features:
+- Preserves existing WETLAND classifications via spatial join
+- Maintains original feat_codes in Original_Code field
+- Flags new vs existing wetlands with IS_NEW field (0=Existing, 1=New)
+- Tracks source wetland IDs for traceability (Source_OBJECTID)
+- Generates lookup table for feat_code to WETLAND mapping
+
+Output Schema - Key Fields:
+- WETLAND: Canadian Wetland Classification (from existing data or assigned)
+- Original_Code: NSTDB feat_code (e.g., 'WASW40', 'WALK40') - PRESERVED FROM SOURCE
+- IS_NEW: 0 = Existing wetland with updated boundary
+           1 = New wetland not in previous dataset
+- Update_Status: Text description ("Existing" or "New")
+- Update_Date: Timestamp of when this update was run
+- Source_OBJECTID: OBJECTID from original wetland feature (NULL for new)
+- feat_code: Original NSTDB field
+- feat_desc: NSTDB feature description
+- SHAPE: Updated geometry from NSTDB
 
 Author: Generated for HRM Wetland Update
 Date: January 2026
@@ -27,9 +46,13 @@ SDE = r"E:\HRM\Scripts\SDE\SQL\Dev\dev_RW_sdeadm.sde"
 EXISTING_WETLANDS = os.path.join(SDE, "SDEADM.NAT_wetland_freshwater")  # Your current wetland data
 NSTDB_WATER_FEATURES = os.path.join(SCRATCH_GDB, "geo_export_HRM")  # Downloaded NSTDB
 
-# Output location
-OUTPUT_NAME = "Wetlands_Updated"  # Name for final output feature class
+# Output location (local geodatabase - ready for truncate/load to SDE)
+OUTPUT_NAME = "Wetlands_Updated"  # Name for final output feature class in SCRATCH_GDB
 LOOKUP_TABLE_NAME = "Wetland_NSTDB_Lookup"  # Lookup table for feat_code to WETLAND mapping
+
+# Note: The output will be created in SCRATCH_GDB and can be used to:
+# 1. Review/QA the updated data
+# 2. Truncate and load into EXISTING_WETLANDS feature class in SDE
 
 # Field names (adjust if your data uses different names)
 EXISTING_CLASS_FIELD = "WETLAND"  # Field containing wetland classification in your data
@@ -300,11 +323,19 @@ def add_update_fields(joined_layer):
     if "Update_Status" not in existing_fields:
         arcpy.AddField_management(joined_layer, "Update_Status", "TEXT", field_length=20)
 
+    if "IS_NEW" not in existing_fields:
+        arcpy.AddField_management(joined_layer, "IS_NEW", "SHORT")
+        log("  Added IS_NEW field (0=Existing, 1=New)")
+
     if "Update_Date" not in existing_fields:
         arcpy.AddField_management(joined_layer, "Update_Date", "DATE")
 
     if "Original_Code" not in existing_fields:
         arcpy.AddField_management(joined_layer, "Original_Code", "TEXT", field_length=20)
+
+    if "Source_OBJECTID" not in existing_fields:
+        arcpy.AddField_management(joined_layer, "Source_OBJECTID", "LONG")
+        log("  Added Source_OBJECTID field (original wetland ID for traceability)")
 
     log("Fields added.")
 
@@ -313,6 +344,7 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data):
     """
     Calculate update status and assign WETLAND classes to all features.
     Uses the lookup_data to determine the best WETLAND class for each feat_code.
+    Populates IS_NEW flag and Source_OBJECTID for traceability.
     """
     log("Calculating fields and assigning WETLAND classes...")
 
@@ -329,14 +361,37 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data):
             # Fall back to default mapping
             feat_to_wetland[feat_code] = DEFAULT_CLASS_MAPPING.get(feat_code, "Needs Review")
 
+    # Find the source OBJECTID field from spatial join (usually TARGET_FID or JOIN_FID)
+    all_fields = [f.name for f in arcpy.ListFields(joined_layer)]
+    source_oid_field = None
+    for potential_field in ["TARGET_FID", "JOIN_FID", "OBJECTID_1", "Join_Count"]:
+        if potential_field in all_fields:
+            if potential_field == "Join_Count":
+                # Use Join_Count as indicator (>0 means matched)
+                source_oid_field = "Join_Count"
+                log(f"  Using {source_oid_field} to determine match status")
+            else:
+                source_oid_field = potential_field
+                log(f"  Found source OBJECTID field: {source_oid_field}")
+            break
+
     # Update records using UpdateCursor
     fields = [
         NSTDB_CODE_FIELD,       # 0
         EXISTING_CLASS_FIELD,   # 1 - WETLAND
         "Update_Status",        # 2
         "Update_Date",          # 3
-        "Original_Code"         # 4
+        "Original_Code",        # 4
+        "IS_NEW",               # 5
+        "Source_OBJECTID"       # 6
     ]
+
+    # Add source field if found
+    if source_oid_field and source_oid_field not in fields:
+        fields.append(source_oid_field)
+        source_oid_index = len(fields) - 1
+    else:
+        source_oid_index = None
 
     now = datetime.now()
     existing_count = 0
@@ -346,6 +401,7 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data):
         for row in cursor:
             feat_code = row[0]
             current_wetland = row[1]
+            source_oid = row[source_oid_index] if source_oid_index else None
 
             # Copy feat_code to Original_Code
             row[4] = feat_code
@@ -357,11 +413,21 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data):
             if current_wetland and str(current_wetland).strip() and str(current_wetland) != 'None':
                 # Existing - has a match from spatial join
                 row[2] = "Existing"
+                row[5] = 0  # IS_NEW = 0 (False)
                 existing_count += 1
                 # Keep the existing wetland class (already populated from spatial join)
+
+                # Try to capture source OBJECTID
+                if source_oid_field == "Join_Count":
+                    # Can't get actual OBJECTID from Join_Count, leave NULL
+                    row[6] = None
+                else:
+                    row[6] = source_oid if source_oid else None
             else:
                 # New - no match from spatial join
                 row[2] = "New"
+                row[5] = 1  # IS_NEW = 1 (True)
+                row[6] = None  # No source OBJECTID for new features
                 new_count += 1
                 # Assign WETLAND class based on lookup or default
                 row[1] = feat_to_wetland.get(feat_code, DEFAULT_CLASS_MAPPING.get(feat_code, "Needs Review"))
@@ -381,34 +447,47 @@ def generate_summary(joined_layer):
     status_counts = {}
     class_counts = {}
     code_counts = {}
+    new_vs_existing = {0: 0, 1: 0}
     needs_review = 0
 
-    fields = ["Update_Status", EXISTING_CLASS_FIELD, "Original_Code"]
+    fields = ["Update_Status", EXISTING_CLASS_FIELD, "Original_Code", "IS_NEW"]
 
     with arcpy.da.SearchCursor(joined_layer, fields) as cursor:
         for row in cursor:
             status = row[0] if row[0] else "Unknown"
             wetland_class = row[1] if row[1] else "None"
             feat_code = row[2] if row[2] else "Unknown"
+            is_new = row[3] if row[3] is not None else -1
 
             status_counts[status] = status_counts.get(status, 0) + 1
             class_counts[wetland_class] = class_counts.get(wetland_class, 0) + 1
             code_counts[feat_code] = code_counts.get(feat_code, 0) + 1
 
+            if is_new in [0, 1]:
+                new_vs_existing[is_new] += 1
+
             if wetland_class == "Needs Review":
                 needs_review += 1
+
+    total_features = sum(status_counts.values())
 
     log("\nBy Update Status:")
     for status, count in sorted(status_counts.items()):
         log(f"  {status}: {count}")
 
+    log("\nBy IS_NEW Flag:")
+    log(f"  Existing (IS_NEW=0): {new_vs_existing[0]}")
+    log(f"  New (IS_NEW=1): {new_vs_existing[1]}")
+
     log("\nBy WETLAND Class:")
     for wclass, count in sorted(class_counts.items()):
         log(f"  {wclass}: {count}")
 
-    log("\nBy feat_code:")
+    log("\nBy feat_code (Original_Code):")
     for code, count in sorted(code_counts.items()):
         log(f"  {code}: {count}")
+
+    log(f"\nTotal Features: {total_features}")
 
     if needs_review > 0:
         log(f"\n⚠️  WARNING: {needs_review} polygons marked 'Needs Review' - manual classification required.")
@@ -490,8 +569,26 @@ def main():
         cleanup_intermediate(intermediate_layers)
 
         log("Script completed successfully!")
-        log(f"Output feature class: {final_output}")
+        log(f"\nOutput feature class: {final_output}")
         log(f"Lookup table: {lookup_table}")
+
+        log("\n" + "=" * 60)
+        log("NEXT STEPS: TRUNCATE AND LOAD")
+        log("=" * 60)
+        log(f"1. Review the output feature class for QA:")
+        log(f"   - Check features where IS_NEW = 1 (new wetlands)")
+        log(f"   - Verify WETLAND classifications")
+        log(f"   - Review any 'Needs Review' classifications")
+        log(f"\n2. Query examples:")
+        log(f"   - New wetlands: IS_NEW = 1")
+        log(f"   - Existing wetlands: IS_NEW = 0")
+        log(f"   - Specific fcode: Original_Code = 'WASW40'")
+        log(f"\n3. When ready to load to SDE:")
+        log(f"   a. Backup existing data: {EXISTING_WETLANDS}")
+        log(f"   b. Truncate: arcpy.TruncateTable_management('{EXISTING_WETLANDS}')")
+        log(f"   c. Append: arcpy.Append_management('{final_output}', '{EXISTING_WETLANDS}', 'NO_TEST')")
+        log(f"\n4. The Original_Code field preserves all NSTDB feat_codes")
+        log("=" * 60)
 
     except Exception as e:
         log(f"ERROR: {str(e)}")
