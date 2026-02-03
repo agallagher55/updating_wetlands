@@ -200,12 +200,77 @@ def spatial_join_classifications(nstdb_layer):
     return output_joined
 
 
-def generate_lookup_table(joined_layer):
+def detect_joined_field_names(joined_layer):
+    """
+    Detect the actual field names after spatial join.
+    ArcGIS renames fields if there are conflicts (e.g., WETLAND -> WETLAND_1).
+    """
+    log("Detecting field names from spatial join...")
+
+    all_fields = [f.name for f in arcpy.ListFields(joined_layer)]
+
+    # Find the WETLAND field from the joined existing data
+    wetland_field_candidates = [
+        EXISTING_CLASS_FIELD,      # Try exact match first (WETLAND)
+        f"{EXISTING_CLASS_FIELD}_1",   # Common rename pattern
+        f"{EXISTING_CLASS_FIELD}_12",  # Another pattern
+    ]
+
+    joined_wetland_field = None
+    for candidate in wetland_field_candidates:
+        if candidate in all_fields:
+            joined_wetland_field = candidate
+            log(f"  Found WETLAND field: {candidate}")
+            break
+
+    if not joined_wetland_field:
+        log(f"  WARNING: Could not find WETLAND field. Checked: {wetland_field_candidates}")
+        log(f"  Available fields: {all_fields}")
+
+    # Find the source OBJECTID field from joined data
+    source_oid_candidates = [
+        "TARGET_FID",
+        "JOIN_FID",
+        "OBJECTID_1",
+        "OBJECTID_12"
+    ]
+
+    source_oid_field = None
+    for candidate in source_oid_candidates:
+        if candidate in all_fields:
+            source_oid_field = candidate
+            log(f"  Found source OBJECTID field: {candidate}")
+            break
+
+    if not source_oid_field:
+        log(f"  WARNING: Could not find source OBJECTID field")
+
+    # Check for Join_Count
+    has_join_count = "Join_Count" in all_fields
+    if has_join_count:
+        log(f"  Found Join_Count field (indicates match status)")
+
+    return {
+        'wetland_field': joined_wetland_field,
+        'source_oid_field': source_oid_field,
+        'has_join_count': has_join_count,
+        'all_fields': all_fields
+    }
+
+
+def generate_lookup_table(joined_layer, field_mapping):
     """
     Generate a lookup table showing the relationship between
     NSTDB feat_code/feat_desc and existing WETLAND classifications.
+
+    Args:
+        joined_layer: The spatially joined feature class
+        field_mapping: Dictionary from detect_joined_field_names() with actual field names
     """
     log("Generating lookup table from spatial join results...")
+
+    # Get the actual WETLAND field name from spatial join
+    joined_wetland_field = field_mapping.get('wetland_field', EXISTING_CLASS_FIELD)
 
     # Dictionary to store: feat_code -> {feat_desc, wetland_counts}
     lookup_data = defaultdict(lambda: {
@@ -214,8 +279,8 @@ def generate_lookup_table(joined_layer):
         'total_count': 0
     })
 
-    # Read the joined data
-    fields = [NSTDB_CODE_FIELD, NSTDB_DESC_FIELD, EXISTING_CLASS_FIELD]
+    # Read the joined data using the correct field name
+    fields = [NSTDB_CODE_FIELD, NSTDB_DESC_FIELD, joined_wetland_field]
 
     with arcpy.da.SearchCursor(joined_layer, fields) as cursor:
         for row in cursor:
@@ -340,11 +405,16 @@ def add_update_fields(joined_layer):
     log("Fields added.")
 
 
-def calculate_fields_and_assign_classes(joined_layer, lookup_data):
+def calculate_fields_and_assign_classes(joined_layer, lookup_data, field_mapping):
     """
     Calculate update status and assign WETLAND classes to all features.
     Uses the lookup_data to determine the best WETLAND class for each feat_code.
     Populates IS_NEW flag and Source_OBJECTID for traceability.
+
+    Args:
+        joined_layer: The spatially joined feature class
+        lookup_data: Dictionary mapping feat_codes to wetland classifications
+        field_mapping: Dictionary from detect_joined_field_names() with actual field names
     """
     log("Calculating fields and assigning WETLAND classes...")
 
@@ -361,80 +431,103 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data):
             # Fall back to default mapping
             feat_to_wetland[feat_code] = DEFAULT_CLASS_MAPPING.get(feat_code, "Needs Review")
 
-    # Find the source OBJECTID field from spatial join (usually TARGET_FID or JOIN_FID)
-    all_fields = [f.name for f in arcpy.ListFields(joined_layer)]
-    source_oid_field = None
-    for potential_field in ["TARGET_FID", "JOIN_FID", "OBJECTID_1", "Join_Count"]:
-        if potential_field in all_fields:
-            if potential_field == "Join_Count":
-                # Use Join_Count as indicator (>0 means matched)
-                source_oid_field = "Join_Count"
-                log(f"  Using {source_oid_field} to determine match status")
-            else:
-                source_oid_field = potential_field
-                log(f"  Found source OBJECTID field: {source_oid_field}")
-            break
+    # Get the actual field names from spatial join
+    joined_wetland_field = field_mapping.get('wetland_field')
+    source_oid_field = field_mapping.get('source_oid_field')
+    has_join_count = field_mapping.get('has_join_count', False)
 
-    # Update records using UpdateCursor
+    if not joined_wetland_field:
+        log("  WARNING: Could not find joined WETLAND field. Using EXISTING_CLASS_FIELD.")
+        joined_wetland_field = EXISTING_CLASS_FIELD
+
+    log(f"  Using field '{joined_wetland_field}' for existing WETLAND classifications")
+    if source_oid_field:
+        log(f"  Using field '{source_oid_field}' for source OBJECTID tracking")
+
+    # Build fields list for cursor
     fields = [
-        NSTDB_CODE_FIELD,       # 0
-        EXISTING_CLASS_FIELD,   # 1 - WETLAND
-        "Update_Status",        # 2
-        "Update_Date",          # 3
-        "Original_Code",        # 4
-        "IS_NEW",               # 5
-        "Source_OBJECTID"       # 6
+        NSTDB_CODE_FIELD,       # 0 - feat_code
+        joined_wetland_field,   # 1 - WETLAND (from joined data, may be WETLAND_1)
+        EXISTING_CLASS_FIELD,   # 2 - WETLAND (target field in output)
+        "Update_Status",        # 3
+        "Update_Date",          # 4
+        "Original_Code",        # 5
+        "IS_NEW",               # 6
+        "Source_OBJECTID"       # 7
     ]
 
-    # Add source field if found
-    if source_oid_field and source_oid_field not in fields:
+    # Add source OBJECTID field if found
+    if source_oid_field:
         fields.append(source_oid_field)
         source_oid_index = len(fields) - 1
     else:
         source_oid_index = None
 
+    # Add Join_Count if available
+    if has_join_count:
+        fields.append("Join_Count")
+        join_count_index = len(fields) - 1
+    else:
+        join_count_index = None
+
     now = datetime.now()
     existing_count = 0
     new_count = 0
+    null_wetland_but_matched = 0
 
     with arcpy.da.UpdateCursor(joined_layer, fields) as cursor:
         for row in cursor:
             feat_code = row[0]
-            current_wetland = row[1]
-            source_oid = row[source_oid_index] if source_oid_index else None
+            joined_wetland = row[1]  # WETLAND value from spatial join (may be from renamed field)
+            source_oid = row[source_oid_index] if source_oid_index is not None else None
+            join_count = row[join_count_index] if join_count_index is not None else None
 
             # Copy feat_code to Original_Code
-            row[4] = feat_code
+            row[5] = feat_code
 
             # Set update date
-            row[3] = now
+            row[4] = now
 
-            # Determine status and assign WETLAND class
-            if current_wetland and str(current_wetland).strip() and str(current_wetland) != 'None':
-                # Existing - has a match from spatial join
-                row[2] = "Existing"
-                row[5] = 0  # IS_NEW = 0 (False)
+            # Determine if this feature matched an existing wetland
+            has_match = False
+            if joined_wetland and str(joined_wetland).strip() and str(joined_wetland) not in ['None', '', ' ']:
+                has_match = True
+            elif join_count and join_count > 0:
+                # Spatial join found a match, but WETLAND field was NULL/empty
+                has_match = False
+                null_wetland_but_matched += 1
+
+            if has_match:
+                # Existing - has a valid match from spatial join
+                row[3] = "Existing"
+                row[6] = 0  # IS_NEW = 0 (False)
                 existing_count += 1
-                # Keep the existing wetland class (already populated from spatial join)
 
-                # Try to capture source OBJECTID
-                if source_oid_field == "Join_Count":
-                    # Can't get actual OBJECTID from Join_Count, leave NULL
-                    row[6] = None
+                # Copy the existing wetland class to the output WETLAND field
+                row[2] = joined_wetland
+
+                # Capture source OBJECTID
+                if source_oid_field and source_oid_field != "Join_Count":
+                    row[7] = source_oid if source_oid else None
                 else:
-                    row[6] = source_oid if source_oid else None
+                    row[7] = None
             else:
-                # New - no match from spatial join
-                row[2] = "New"
-                row[5] = 1  # IS_NEW = 1 (True)
-                row[6] = None  # No source OBJECTID for new features
+                # New - no match from spatial join OR matched but WETLAND was NULL
+                row[3] = "New"
+                row[6] = 1  # IS_NEW = 1 (True)
+                row[7] = None  # No source OBJECTID for new features
                 new_count += 1
+
                 # Assign WETLAND class based on lookup or default
-                row[1] = feat_to_wetland.get(feat_code, DEFAULT_CLASS_MAPPING.get(feat_code, "Needs Review"))
+                assigned_class = feat_to_wetland.get(feat_code, DEFAULT_CLASS_MAPPING.get(feat_code, "Needs Review"))
+                row[2] = assigned_class
 
             cursor.updateRow(row)
 
     log(f"Status calculated: {existing_count} existing, {new_count} new polygons.")
+    if null_wetland_but_matched > 0:
+        log(f"  ⚠️  WARNING: {null_wetland_but_matched} features matched spatially but had NULL/empty WETLAND values")
+        log(f"      These are treated as 'New' and assigned classification based on feat_code")
 
 
 def generate_summary(joined_layer):
@@ -549,22 +642,25 @@ def main():
         joined_layer = spatial_join_classifications(nstdb_projected)
         # Don't add to intermediate - we'll use this for final output
 
-        # Step 5: Generate lookup table BEFORE modifying the joined layer
-        lookup_table, lookup_data = generate_lookup_table(joined_layer)
+        # Step 5: Detect actual field names after spatial join
+        field_mapping = detect_joined_field_names(joined_layer)
 
-        # Step 6: Add tracking fields
+        # Step 6: Generate lookup table BEFORE modifying the joined layer
+        lookup_table, lookup_data = generate_lookup_table(joined_layer, field_mapping)
+
+        # Step 7: Add tracking fields
         add_update_fields(joined_layer)
 
-        # Step 7: Calculate fields and assign WETLAND classes
-        calculate_fields_and_assign_classes(joined_layer, lookup_data)
+        # Step 8: Calculate fields and assign WETLAND classes
+        calculate_fields_and_assign_classes(joined_layer, lookup_data, field_mapping)
 
-        # Step 8: Generate summary
+        # Step 9: Generate summary
         generate_summary(joined_layer)
 
-        # Step 9: Create final output
+        # Step 10: Create final output
         final_output = copy_final_output(joined_layer)
 
-        # Step 10: Cleanup (keep joined_layer for now, delete others)
+        # Step 11: Cleanup (keep joined_layer for now, delete others)
         intermediate_layers.append(joined_layer)
         cleanup_intermediate(intermediate_layers)
 
