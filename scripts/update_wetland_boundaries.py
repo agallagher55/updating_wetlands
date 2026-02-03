@@ -184,6 +184,47 @@ def spatial_join_classifications(nstdb_layer):
     if arcpy.Exists(output_joined):
         arcpy.Delete_management(output_joined)
 
+    # Create field mapping to explicitly control which fields are transferred
+    # This prevents field name conflicts and ensures proper attribute transfer
+    log("  Creating field mapping for spatial join...")
+
+    # Create FieldMappings object
+    field_mappings = arcpy.FieldMappings()
+
+    # Add all fields from NSTDB (target)
+    field_mappings.addTable(nstdb_layer)
+
+    # Add specific fields from existing wetlands (join)
+    # Create field map for WETLAND
+    fm_wetland = arcpy.FieldMap()
+    fm_wetland.addInputField(EXISTING_WETLANDS, EXISTING_CLASS_FIELD)
+    wetland_field = fm_wetland.outputField
+    wetland_field.name = "WETLAND_Join"  # Rename to avoid conflict
+    wetland_field.aliasName = "WETLAND (from existing)"
+    fm_wetland.outputField = wetland_field
+    field_mappings.addFieldMap(fm_wetland)
+
+    # Create field map for HECTARES
+    fm_hectares = arcpy.FieldMap()
+    fm_hectares.addInputField(EXISTING_WETLANDS, "HECTARES")
+    hectares_field = fm_hectares.outputField
+    hectares_field.name = "HECTARES_Join"
+    hectares_field.aliasName = "HECTARES (from existing)"
+    fm_hectares.outputField = hectares_field
+    field_mappings.addFieldMap(fm_hectares)
+
+    # Create field map for OBJECTID from existing wetlands
+    fm_objectid = arcpy.FieldMap()
+    fm_objectid.addInputField(EXISTING_WETLANDS, "OBJECTID")
+    objectid_field = fm_objectid.outputField
+    objectid_field.name = "Source_OID"
+    objectid_field.aliasName = "Source OBJECTID"
+    objectid_field.type = "Integer"
+    fm_objectid.outputField = objectid_field
+    field_mappings.addFieldMap(fm_objectid)
+
+    log("  Field mapping created with explicit field names")
+
     # Spatial join: new geometry gets classification from largest overlapping old polygon
     # arcpy.SpatialJoin_analysis(
     #     target_features=nstdb_layer,
@@ -199,17 +240,8 @@ def spatial_join_classifications(nstdb_layer):
         out_feature_class=output_joined,
         join_operation="JOIN_ONE_TO_ONE",
         join_type="KEEP_ALL",
-        field_mapping=f'{NSTDB_CODE_FIELD} "{NSTDB_CODE_FIELD}" true true false 254 Text 0 0,First,#,{nstdb_layer},{NSTDB_CODE_FIELD},0,253;'
-                      f'{NSTDB_DESC_FIELD} "{NSTDB_DESC_FIELD}" true true false 254 Text 0 0,First,#,{nstdb_layer},{NSTDB_DESC_FIELD},0,253;'
-                      f'zvalue "zvalue" true true false 8 Double 0 0,First,#,{nstdb_layer},zvalue,-1,-1;'
-                      f'Shape_Length "Shape_Length" false true true 8 Double 0 0,First,#,{nstdb_layer},Shape_Length,-1,-1;'
-                      f'Shape_Area "Shape_Area" false true true 8 Double 0 0,First,#,{nstdb_layer},Shape_Area,-1,-1;'
-                      f'{EXISTING_CLASS_FIELD} "Wetland Class" true true false 24 Text 0 0,First,#,{EXISTING_WETLANDS},{EXISTING_CLASS_FIELD},0,23;'
-                      f'HECTARES "Hectares" true true false 8 Double 8 38,First,#,{EXISTING_WETLANDS},HECTARES,-1,-1',
-        match_option="LARGEST_OVERLAP",
-        search_radius=None,
-        distance_field_name="",
-        match_fields=None
+        field_mapping=field_mappings,
+        match_option="LARGEST_OVERLAP"
     )
 
     count = int(arcpy.GetCount_management(output_joined)[0])
@@ -221,17 +253,21 @@ def spatial_join_classifications(nstdb_layer):
 def detect_joined_field_names(joined_layer):
     """
     Detect the actual field names after spatial join.
-    ArcGIS renames fields if there are conflicts (e.g., WETLAND -> WETLAND_1).
+    With explicit field mapping, we know the field names, but this validates they exist.
     """
     log("Detecting field names from spatial join...")
 
     all_fields = [f.name for f in arcpy.ListFields(joined_layer)]
 
-    # Find the WETLAND field from the joined existing data
+    # With explicit field mapping, we know the field names:
+    # - WETLAND_Join: WETLAND classification from existing wetlands
+    # - HECTARES_Join: HECTARES from existing wetlands
+    # - Source_OID: OBJECTID from existing wetlands
+
     wetland_field_candidates = [
-        EXISTING_CLASS_FIELD,      # Try exact match first (WETLAND)
-        f"{EXISTING_CLASS_FIELD}_1",   # Common rename pattern
-        f"{EXISTING_CLASS_FIELD}_12",  # Another pattern
+        "WETLAND_Join",            # Our explicit field mapping name
+        EXISTING_CLASS_FIELD,      # Fallback if no field mapping
+        f"{EXISTING_CLASS_FIELD}_1",   # Old rename pattern
     ]
 
     joined_wetland_field = None
@@ -251,7 +287,6 @@ def detect_joined_field_names(joined_layer):
         "JOIN_FID",      # OBJECTID from EXISTING_WETLANDS - this is what we want!
         "TARGET_FID",    # OBJECTID from filtered NSTDB (not what we want)
         "OBJECTID_1",
-        "OBJECTID_12"
     ]
 
     source_oid_field = None
@@ -265,6 +300,20 @@ def detect_joined_field_names(joined_layer):
     if not source_oid_field:
         log(f"  WARNING: Could not find source OBJECTID field")
 
+    # Check for HECTARES field
+    hectares_field_candidates = [
+        "HECTARES_Join",    # Our explicit field mapping name
+        "HECTARES",
+        "HECTARES_1"
+    ]
+
+    hectares_field = None
+    for candidate in hectares_field_candidates:
+        if candidate in all_fields:
+            hectares_field = candidate
+            log(f"  Found HECTARES field: {candidate}")
+            break
+
     # Check for Join_Count
     has_join_count = "Join_Count" in all_fields
     if has_join_count:
@@ -273,6 +322,7 @@ def detect_joined_field_names(joined_layer):
     return {
         'wetland_field': joined_wetland_field,
         'source_oid_field': source_oid_field,
+        'hectares_field': hectares_field,
         'has_join_count': has_join_count,
         'all_fields': all_fields
     }
