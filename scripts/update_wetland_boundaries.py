@@ -451,6 +451,10 @@ def add_update_fields(joined_layer):
         arcpy.AddField_management(joined_layer, EXISTING_CLASS_FIELD, "TEXT", field_length=50)
         log(f"  Added {EXISTING_CLASS_FIELD} field (output wetland classification)")
 
+    if "Previous_WETLAND" not in existing_fields:
+        arcpy.AddField_management(joined_layer, "Previous_WETLAND", "TEXT", field_length=50)
+        log("  Added Previous_WETLAND field (original wetland classification for tracking changes)")
+
     if "Update_Status" not in existing_fields:
         arcpy.AddField_management(joined_layer, "Update_Status", "TEXT", field_length=20)
 
@@ -513,13 +517,14 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data, field_mapping
     # Build fields list for cursor
     fields = [
         NSTDB_CODE_FIELD,       # 0 - feat_code
-        joined_wetland_field,   # 1 - WETLAND (from joined data, may be WETLAND_1)
+        joined_wetland_field,   # 1 - WETLAND_Join (from joined data)
         EXISTING_CLASS_FIELD,   # 2 - WETLAND (target field in output)
         "Update_Status",        # 3
         "Update_Date",          # 4
         "Original_Code",        # 5
         "IS_NEW",               # 6
-        "Source_OBJECTID"       # 7
+        "Source_OBJECTID",      # 7
+        "Previous_WETLAND"      # 8 - Original wetland classification
     ]
 
     # Add source OBJECTID field if found
@@ -572,6 +577,9 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data, field_mapping
                 # Copy the existing wetland class to the output WETLAND field
                 row[2] = joined_wetland
 
+                # Store the previous wetland classification (from existing data)
+                row[8] = joined_wetland
+
                 # Capture source OBJECTID
                 if source_oid_field and source_oid_field != "Join_Count":
                     row[7] = source_oid if source_oid else None
@@ -582,6 +590,7 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data, field_mapping
                 row[3] = "New"
                 row[6] = 1  # IS_NEW = 1 (True)
                 row[7] = None  # No source OBJECTID for new features
+                row[8] = None  # No previous WETLAND for new features
                 new_count += 1
 
                 # Assign WETLAND class based on lookup or default
