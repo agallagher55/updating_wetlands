@@ -12,7 +12,7 @@ import arcpy
 # Configuration - UPDATE THESE
 WETLANDS_UPDATED = r"T:\work\giss\monthly\202601jan\gallaga\lakes_and_streams_planning\data\scratch.gdb\Wetlands_Updated"
 EXISTING_WETLANDS = r"E:\HRM\Scripts\SDE\SQL\Dev\dev_RW_sdeadm.sde\SDEADM.NAT_wetland_freshwater"
-PROBLEM_OBJECTID = 6872  # The OBJECTID from Wetlands_Updated that's marked as "New"
+PROBLEM_OBJECTID = 6972  # The OBJECTID from Wetlands_Updated that's marked as "New"
 
 # Investigation
 print("=" * 80)
