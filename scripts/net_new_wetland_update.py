@@ -51,6 +51,23 @@ RELEVANT_FEAT_CODES = [
     "WARA40",
 ]
 
+# Mapping from NSTDB feat_code to WETLAND description for new features.
+# These values align with NAT_wetland_freshwater WETLAND field values.
+FEAT_CODE_TO_WETLAND = {
+    "WASW40": "Swamp",
+    "WALK40": "Lake",
+    "WARV40": "River",
+    "WARS40": "River",
+    "WACO40": "Coastal",
+    "WACB40": "Coastal",
+    "WACORV40": "Coastal",
+    "WARVLK40": "Lake",
+    "WACA40": "Canal",
+    "WAFI40": "Filled",
+    "WAFU40": "Functional",
+    "WARA40": "Rapid",
+}
+
 
 def log(message):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
@@ -212,6 +229,11 @@ def populate_update_fields(joined_layer):
     ]
 
     now = datetime.now()
+    new_count = 0
+    existing_count = 0
+    wetland_assigned = 0
+    wetland_missing = 0
+
     with arcpy.da.UpdateCursor(joined_layer, fields) as cursor:
         for row in cursor:
             feat_code = row[0]
@@ -227,14 +249,27 @@ def populate_update_fields(joined_layer):
             if join_count == 0:
                 row[6] = 1
                 row[3] = "New"
-                row[2] = None
+                # Assign WETLAND description based on feat_code lookup
+                wetland_value = FEAT_CODE_TO_WETLAND.get(feat_code)
+                row[2] = wetland_value
                 row[7] = None
+                new_count += 1
+                if wetland_value:
+                    wetland_assigned += 1
+                else:
+                    wetland_missing += 1
+                    log(f"WARNING: No WETLAND mapping for feat_code '{feat_code}'")
             else:
                 row[6] = 0
                 row[3] = "Existing"
                 row[2] = joined_wetland
+                existing_count += 1
 
             cursor.updateRow(row)
+
+    log(f"Processed {new_count + existing_count} features:")
+    log(f"  - New features: {new_count} (WETLAND assigned: {wetland_assigned}, missing: {wetland_missing})")
+    log(f"  - Existing features: {existing_count}")
 
 
 def write_outputs(joined_layer, existing_joined):
