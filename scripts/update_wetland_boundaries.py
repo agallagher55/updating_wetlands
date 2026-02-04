@@ -284,6 +284,7 @@ def detect_joined_field_names(joined_layer):
     # Find the source OBJECTID field from joined data (EXISTING_WETLANDS)
     # JOIN_FID = OBJECTID from join_features (the existing wetlands)
     source_oid_candidates = [
+        "Source_OID",   # Explicit field mapping name
         "JOIN_FID",      # OBJECTID from EXISTING_WETLANDS - this is what we want!
         "TARGET_FID",    # OBJECTID from filtered NSTDB (not what we want)
         "OBJECTID_1",
@@ -341,6 +342,12 @@ def generate_lookup_table(joined_layer, field_mapping):
 
     # Get the actual WETLAND field name from spatial join
     joined_wetland_field = field_mapping.get('wetland_field', EXISTING_CLASS_FIELD)
+    all_fields = field_mapping.get('all_fields') or [f.name for f in arcpy.ListFields(joined_layer)]
+    if joined_wetland_field not in all_fields:
+        raise ValueError(
+            f"Joined WETLAND field '{joined_wetland_field}' not found in spatial join output. "
+            f"Available fields: {all_fields}"
+        )
 
     # Dictionary to store: feat_code -> {feat_desc, wetland_counts}
     lookup_data = defaultdict(lambda: {
@@ -486,10 +493,6 @@ def add_update_fields(joined_layer):
     if safe_add_field(joined_layer, "Source_OBJECTID", "LONG"):
         log("  Added Source_OBJECTID field (original wetland ID for traceability)")
 
-    if "Previous_WETLAND" not in existing_fields:
-        arcpy.AddField_management(joined_layer, "Previous_WETLAND", "TEXT", field_length=24)
-        log("  Added Previous_WETLAND field (tracks existing WETLAND classification)")
-
     log("Fields added.")
 
 
@@ -533,18 +536,28 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data, field_mapping
     if source_oid_field:
         log(f"  Using field '{source_oid_field}' for source OBJECTID tracking")
 
-    # Build fields list for cursor
-    fields = [
-        NSTDB_CODE_FIELD,  # 0 - feat_code
-        joined_wetland_field,  # 1 - WETLAND (from NAT_wetland_freshwater via spatial join)
-        EXISTING_CLASS_FIELD,  # 2 - WETLAND (target field in output)
-        "Update_Status",  # 3
-        "Update_Date",  # 4
-        "Original_Code",  # 5
-        "IS_NEW",  # 6
-        "Source_OBJECTID",  # 7
-        "Previous_WETLAND"  # 8 - Always stores the WETLAND value from NAT_wetland_freshwater
-    ]
+    # Build fields list for cursor (avoid duplicate field names)
+    fields = [NSTDB_CODE_FIELD]  # 0 - feat_code
+    field_indexes = {}
+
+    if joined_wetland_field and joined_wetland_field != EXISTING_CLASS_FIELD:
+        fields.append(joined_wetland_field)  # WETLAND from NAT_wetland_freshwater via spatial join
+        field_indexes["joined_wetland"] = len(fields) - 1
+
+    fields.append(EXISTING_CLASS_FIELD)  # WETLAND target field in output
+    field_indexes["output_wetland"] = len(fields) - 1
+
+    fields.extend([
+        "Update_Status",
+        "Update_Date",
+        "Original_Code",
+        "IS_NEW",
+        "Source_OBJECTID",
+        "Previous_WETLAND"
+    ])
+
+    if "joined_wetland" not in field_indexes:
+        field_indexes["joined_wetland"] = field_indexes["output_wetland"]
 
     # Add source OBJECTID field if found
     if source_oid_field:
@@ -569,19 +582,19 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data, field_mapping
     with arcpy.da.UpdateCursor(joined_layer, fields) as cursor:
         for row in cursor:
             feat_code = row[0]
-            joined_wetland = row[1]  # WETLAND value from NAT_wetland_freshwater (via spatial join)
+            joined_wetland = row[field_indexes["joined_wetland"]]  # WETLAND from NAT_wetland_freshwater
             source_oid = row[source_oid_index] if source_oid_index is not None else None
             join_count = row[join_count_index] if join_count_index is not None else None
 
             # Copy feat_code to Original_Code
-            row[5] = feat_code
+            row[field_indexes["output_wetland"] + 3] = feat_code
 
             # Set update date
-            row[4] = now
+            row[field_indexes["output_wetland"] + 2] = now
 
             # ALWAYS store the WETLAND value from NAT_wetland_freshwater in Previous_WETLAND
             # This will be None/NULL for new features that didn't match anything
-            row[8] = joined_wetland if joined_wetland and str(joined_wetland).strip() and str(joined_wetland) not in [
+            row[field_indexes["output_wetland"] + 6] = joined_wetland if joined_wetland and str(joined_wetland).strip() and str(joined_wetland) not in [
                 'None', '', ' '] else None
 
             # Determine if this is new or existing based on Join_Count
@@ -589,52 +602,55 @@ def calculate_fields_and_assign_classes(joined_layer, lookup_data, field_mapping
                 # Use Join_Count to determine status
                 if join_count == 0:
                     # IS_NEW = 1 (no match found - this is a brand new wetland)
-                    row[6] = 1
-                    row[3] = "New"
-                    row[7] = None  # No source OBJECTID for new features
+                    row[field_indexes["output_wetland"] + 4] = 1
+                    row[field_indexes["output_wetland"] + 1] = "New"
+                    row[field_indexes["output_wetland"] + 5] = None  # No source OBJECTID for new features
                     new_count += 1
 
                     # Assign WETLAND class based on lookup or default
                     assigned_class = feat_to_wetland.get(feat_code,
                                                          DEFAULT_CLASS_MAPPING.get(feat_code, "Needs Review"))
-                    row[2] = assigned_class
+                    row[field_indexes["output_wetland"]] = assigned_class
                 else:
                     # IS_NEW = 0 (match found - this is an existing wetland)
-                    row[6] = 0
-                    row[3] = "Existing"
+                    row[field_indexes["output_wetland"] + 4] = 0
+                    row[field_indexes["output_wetland"] + 1] = "Existing"
                     existing_count += 1
 
                     # PRESERVE the existing WETLAND classification from NAT_wetland_freshwater
                     if joined_wetland and str(joined_wetland).strip() and str(joined_wetland) not in ['None', '', ' ']:
                         # Keep the existing WETLAND value - DO NOT CHANGE IT
-                        row[2] = joined_wetland
+                        row[field_indexes["output_wetland"]] = joined_wetland
                         preserved_count += 1
                     else:
                         # Existing wetland but WETLAND was NULL in source - assign based on feat_code
                         assigned_class = feat_to_wetland.get(feat_code, "Needs Review")
-                        row[2] = assigned_class
+                        row[field_indexes["output_wetland"]] = assigned_class
                         log(f"  Note: Existing feature (OID {source_oid}) had NULL WETLAND, assigned '{assigned_class}'")
 
                     # Capture source OBJECTID (JOIN_FID)
                     if source_oid_index is not None:
-                        row[7] = source_oid if source_oid else None
+                        row[field_indexes["output_wetland"] + 5] = source_oid if source_oid else None
                     else:
-                        row[7] = None
+                        row[field_indexes["output_wetland"] + 5] = None
             else:
                 # Fallback if Join_Count is not available (shouldn't happen with proper spatial join)
                 log("  WARNING: Processing without Join_Count - results may be unreliable")
                 if joined_wetland and str(joined_wetland).strip() and str(joined_wetland) not in ['None', '', ' ']:
-                    row[6] = 0
-                    row[3] = "Existing"
-                    row[2] = joined_wetland  # Keep existing value
-                    row[7] = source_oid if source_oid_index is not None else None
+                    row[field_indexes["output_wetland"] + 4] = 0
+                    row[field_indexes["output_wetland"] + 1] = "Existing"
+                    row[field_indexes["output_wetland"]] = joined_wetland  # Keep existing value
+                    row[field_indexes["output_wetland"] + 5] = source_oid if source_oid_index is not None else None
                     existing_count += 1
                     preserved_count += 1
                 else:
-                    row[6] = 1
-                    row[3] = "New"
-                    row[2] = feat_to_wetland.get(feat_code, DEFAULT_CLASS_MAPPING.get(feat_code, "Needs Review"))
-                    row[7] = None
+                    row[field_indexes["output_wetland"] + 4] = 1
+                    row[field_indexes["output_wetland"] + 1] = "New"
+                    row[field_indexes["output_wetland"]] = feat_to_wetland.get(
+                        feat_code,
+                        DEFAULT_CLASS_MAPPING.get(feat_code, "Needs Review")
+                    )
+                    row[field_indexes["output_wetland"] + 5] = None
                     new_count += 1
 
             cursor.updateRow(row)
